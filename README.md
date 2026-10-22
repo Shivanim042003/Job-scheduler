@@ -1,5 +1,7 @@
 # Distributed Job Scheduler
 
+![CI](https://github.com/Shivanim042003/Job-scheduler/actions/workflows/ci.yml/badge.svg)
+
 Asynchronous job submission, persistent job tracking, and execution across containerized workers.
 **Java 17 · Spring Boot 3.5 · PostgreSQL · RabbitMQ · Docker**
 
@@ -105,8 +107,56 @@ mvn verify        # needs Docker: Testcontainers starts real PostgreSQL and Rabb
 - message for an unknown job → dead-lettered
 - lost publish → sweeper recovers the job
 
-`JobApiIntegrationTest` covers submission (202), tracking, 404 and validation errors; `BackoffPolicyTest` covers the
-delay math.
+`JobClaimConcurrencyIntegrationTest` races 8 workers on one job (repeated 5x) and checks exactly one wins, and that a
+worker acting on a stale read cannot claim a job another worker already took.
+`StaleWorkerFencingIntegrationTest` covers a worker that was presumed dead reporting late: its result is rejected and
+cannot overwrite the worker that took over, or reopen a finished job.
+`IdempotentExecutionIntegrationTest` covers the effect ledger, including a job re-executed after its side effect was
+applied (handler runs twice, effect once).
+`JobApiIntegrationTest` covers submission (202), tracking, 404 and validation errors; `MetricsIntegrationTest` checks
+the Prometheus endpoint; `BackoffPolicyTest` covers the delay math.
+
+## What the conditional updates guarantee (and what they don't)
+
+- **Claim:** `UPDATE ... WHERE status IN (claimable) AND attempts = <attempts I read>`. Two workers racing on the
+  same job cannot both win, including two racing to take over a crashed worker's job.
+- **Result (fencing):** success, retry and dead-letter writes carry `WHERE status = RUNNING AND worker_id = <me> AND
+  attempts = <my attempt>`. A worker that was presumed dead and replaced gets zero rows updated, discards its
+  result, and schedules nothing. It also cannot reopen a finished job.
+- **Not guaranteed:** exactly-once *execution*. A crash after a handler's side effect but before the result is
+  recorded re-runs the handler. Use `IdempotentEffects.runOnce(jobId, key, effect)` so the effect is applied once:
+  exactly once for effects in this database (ledger row and effect commit in one transaction), and for external
+  systems by passing `jobId + key` as their idempotency key.
+- **Delivery:** consumer side is manual acks (a crashed worker's message is redelivered). Producer side is a
+  committed row, publisher confirms, and a sweeper that republishes jobs stuck in `QUEUED`.
+
+## Observability
+
+The API exposes Prometheus metrics at `http://localhost:8081/actuator/prometheus`:
+
+| metric | meaning |
+|---|---|
+| `jobs_by_status{status}` | jobs in each lifecycle state (from PostgreSQL) |
+| `jobs_queue_depth{queue}` | messages in `main`, `retry` and `dead_letter` queues (from RabbitMQ) |
+| `jobs_execution_seconds{outcome}` | execution time per attempt, recorded by workers |
+| `jobs_retries_total`, `jobs_dead_total{reason}`, `jobs_stale_results_total` | retries scheduled, jobs dead-lettered, discarded stale results (workers) |
+
+Worker-side metrics live in each worker's registry; the compose file runs workers without a web server, so to scrape
+them remove `SPRING_MAIN_WEBAPPLICATIONTYPE: none` from the worker service.
+
+## Benchmarking
+
+`scripts/loadtest.py` (Python 3.8+, no dependencies) submits a burst of jobs, waits for them to finish, and reports
+throughput and p50/p95/p99 latency from the server's own timestamps. To measure scaling:
+
+```bash
+docker compose up -d --scale worker=1 && python scripts/loadtest.py --jobs 300 --work-ms 100
+docker compose up -d --scale worker=3 && python scripts/loadtest.py --jobs 300 --work-ms 100
+docker compose up -d --scale worker=6 && python scripts/loadtest.py --jobs 300 --work-ms 100
+```
+
+The ceiling is roughly `workers x consumers-per-worker / work-ms` (2 consumers per worker by default). Add the
+results here once measured, together with the machine they were measured on.
 
 ## Known limitations / next steps
 

@@ -5,6 +5,8 @@ import com.jobscheduler.messaging.BackoffPolicy;
 import com.jobscheduler.messaging.JobPublisher;
 import com.jobscheduler.service.ClaimResult;
 import com.jobscheduler.service.JobService;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
@@ -34,14 +36,17 @@ public class JobProcessor {
     private final JobExecutor executor;
     private final JobPublisher publisher;
     private final BackoffPolicy backoff;
+    private final MeterRegistry meterRegistry;
     private final String workerId =
             System.getenv().getOrDefault("HOSTNAME", "worker") + "-" + UUID.randomUUID().toString().substring(0, 8);
 
-    public JobProcessor(JobService jobService, JobExecutor executor, JobPublisher publisher, BackoffPolicy backoff) {
+    public JobProcessor(JobService jobService, JobExecutor executor, JobPublisher publisher, BackoffPolicy backoff,
+                        MeterRegistry meterRegistry) {
         this.jobService = jobService;
         this.executor = executor;
         this.publisher = publisher;
         this.backoff = backoff;
+        this.meterRegistry = meterRegistry;
     }
 
     /**
@@ -66,17 +71,26 @@ public class JobProcessor {
         log.info("Running job {} type={} attempt={}/{} redelivered={}",
                 job.getId(), job.getType(), job.getAttempts(), job.getMaxAttempts(), redelivered);
 
+        Timer.Sample sample = Timer.start(meterRegistry);
         try {
             executor.execute(job);
         } catch (NonRetryableJobException e) {
+            stop(sample, "non_retryable");
             log.warn("Job {} failed permanently: {}", job.getId(), e.getMessage());
-            jobService.markDead(job.getId(), "Non-retryable: " + e.getMessage());
+            if (!jobService.markDead(job, "Non-retryable: " + e.getMessage())) {
+                return staleOwner(job);
+            }
+            meterRegistry.counter("jobs.dead", "reason", "non_retryable").increment();
             return Settlement.DEAD_LETTER;
         } catch (Exception e) {
+            stop(sample, "failed");
             return handleFailure(job, e);
         }
 
-        jobService.markSucceeded(job.getId());
+        stop(sample, "succeeded");
+        if (!jobService.markSucceeded(job)) {
+            return staleOwner(job);
+        }
         log.info("Job {} succeeded on attempt {}", job.getId(), job.getAttempts());
         return Settlement.ACK;
     }
@@ -87,17 +101,35 @@ public class JobProcessor {
 
         if (attempt >= job.getMaxAttempts()) {
             log.error("Job {} exhausted {} attempts; dead-lettering", job.getId(), attempt, failure);
-            jobService.markDead(job.getId(), "Retries exhausted after " + attempt + " attempts. Last error: " + error);
+            if (!jobService.markDead(job, "Retries exhausted after " + attempt + " attempts. Last error: " + error)) {
+                return staleOwner(job);
+            }
+            meterRegistry.counter("jobs.dead", "reason", "retries_exhausted").increment();
             return Settlement.DEAD_LETTER;
         }
 
         Duration delay = backoff.delayFor(attempt);
         log.warn("Job {} failed on attempt {}/{}; retrying in {}: {}",
                 job.getId(), attempt, job.getMaxAttempts(), delay, error);
-        jobService.markRetrying(job.getId(), error, Instant.now().plus(delay));
+        if (!jobService.markRetrying(job, error, Instant.now().plus(delay))) {
+            return staleOwner(job);
+        }
+        meterRegistry.counter("jobs.retries").increment();
         // If this publish throws, the listener requeues the original message instead of acking it,
         // so the job is redelivered rather than lost.
         publisher.publishRetry(job.getId(), attempt);
         return Settlement.ACK;
+    }
+
+    /** Another worker took this job over (or it already finished): drop this result and schedule nothing. */
+    private Settlement staleOwner(Job job) {
+        log.warn("Job {} attempt {} is no longer owned by this worker; discarding its result",
+                job.getId(), job.getAttempts());
+        meterRegistry.counter("jobs.stale.results").increment();
+        return Settlement.ACK;
+    }
+
+    private void stop(Timer.Sample sample, String outcome) {
+        sample.stop(meterRegistry.timer("jobs.execution", "outcome", outcome));
     }
 }

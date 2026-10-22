@@ -23,7 +23,7 @@ import org.springframework.test.context.ActiveProfiles;
                 "scheduler.retry.max-delay=2s",
                 "scheduler.sweeper.interval-millis=500",
                 "scheduler.sweeper.stale-after=2s",
-                "spring.rabbitmq.listener.simple.concurrency=1"
+                "spring.rabbitmq.listener.simple.concurrency=1", "management.prometheus.metrics.export.enabled=true"
         })
 @ActiveProfiles({"api", "worker"})
 @Import({TestcontainersConfig.class, TestHandlers.class})

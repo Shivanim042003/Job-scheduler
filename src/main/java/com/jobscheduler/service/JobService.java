@@ -128,23 +128,31 @@ public class JobService {
         }
 
         Set<JobStatus> from = redelivered ? CLAIMABLE_ON_REDELIVERY : CLAIMABLE;
-        int updated = repository.claim(jobId, from, JobStatus.RUNNING, Instant.now(), workerId);
+        // Compare-and-set on the attempt count we just read: a concurrent claimer that got in first makes this a no-op.
+        int updated = repository.claim(jobId, from, JobStatus.RUNNING, Instant.now(), workerId, job.getAttempts());
         if (updated == 0) {
             return ClaimResult.skip();
         }
         return ClaimResult.claimed(repository.findById(jobId).orElseThrow());
     }
 
-    public void markSucceeded(UUID jobId) {
-        repository.markSucceeded(jobId, JobStatus.RUNNING, JobStatus.SUCCEEDED, Instant.now());
+    // Result writes are fenced: they apply only while this exact worker still owns this exact attempt. A worker
+    // that was presumed dead and replaced (its job was taken over, or already finished) gets `false` and must
+    // discard its result instead of overwriting the new owner's.
+
+    public boolean markSucceeded(Job job) {
+        return repository.markSucceeded(job.getId(), JobStatus.RUNNING, JobStatus.SUCCEEDED, Instant.now(),
+                job.getWorkerId(), job.getAttempts()) == 1;
     }
 
-    public void markRetrying(UUID jobId, String error, Instant nextRunAt) {
-        repository.markRetrying(jobId, JobStatus.RUNNING, JobStatus.RETRYING, truncate(error), nextRunAt, Instant.now());
+    public boolean markRetrying(Job job, String error, Instant nextRunAt) {
+        return repository.markRetrying(job.getId(), JobStatus.RUNNING, JobStatus.RETRYING, truncate(error),
+                nextRunAt, Instant.now(), job.getWorkerId(), job.getAttempts()) == 1;
     }
 
-    public void markDead(UUID jobId, String error) {
-        repository.markDead(jobId, NOT_TERMINAL, JobStatus.DEAD, truncate(error), Instant.now());
+    public boolean markDead(Job job, String error) {
+        return repository.markDeadOwned(job.getId(), JobStatus.RUNNING, JobStatus.DEAD, truncate(error),
+                Instant.now(), job.getWorkerId(), job.getAttempts()) == 1;
     }
 
     // ---------------------------------------------------------------- recovery
