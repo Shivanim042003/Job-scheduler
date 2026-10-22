@@ -1,0 +1,58 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: jobs
+      POSTGRES_USER: jobs
+      POSTGRES_PASSWORD: jobs
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobs -d jobs"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"   # management UI: http://localhost:15672 (guest/guest)
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Accepts job submissions and exposes the REST API.
+  api:
+    build: .
+    environment: &app-env
+      SPRING_PROFILES_ACTIVE: api
+      DB_URL: jdbc:postgresql://postgres:5432/jobs
+      DB_USER: jobs
+      DB_PASSWORD: jobs
+      RABBITMQ_HOST: rabbitmq
+    ports:
+      - "8081:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # Stateless workers: scale horizontally with `docker compose up --scale worker=N`.
+  worker:
+    build: .
+    environment:
+      <<: *app-env
+      SPRING_PROFILES_ACTIVE: worker
+      SPRING_MAIN_WEBAPPLICATIONTYPE: none
+      WORKER_CONCURRENCY: "2"
+    deploy:
+      replicas: 3
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy

@@ -1,0 +1,38 @@
+spring:
+  application:
+    name: job-scheduler
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/jobs}
+    username: ${DB_USER:jobs}
+    password: ${DB_PASSWORD:jobs}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USER:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
+    publisher-confirm-type: correlated
+    listener:
+      simple:
+        acknowledge-mode: manual      # workers ack only after the DB state is updated
+        prefetch: 1                   # fair dispatch: one unacked job per consumer thread
+        concurrency: ${WORKER_CONCURRENCY:2}
+        default-requeue-rejected: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+scheduler:
+  retry:
+    max-attempts: 5          # total executions per job, including the first
+    initial-delay: 2s        # delay before attempt 2; doubles each attempt
+    max-delay: 5m
+  sweeper:
+    interval-millis: 5000    # how often the API looks for jobs whose publish was lost
+    stale-after: 30s
