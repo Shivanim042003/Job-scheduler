@@ -2,23 +2,25 @@
 """
 Load test for the job scheduler. Standard library only (Python 3.8+).
 
-Submits N jobs as fast as possible, waits for all of them to reach a terminal state, then reports throughput and
-end-to-end latency computed from the SERVER's own timestamps (createdAt -> finishedAt), so client polling
-granularity does not distort the result.
+Submits N "sleep" jobs (each simulates --work-ms of work), waits for all of them to reach a terminal state, then
+reports throughput and end-to-end latency computed from the SERVER's own timestamps (createdAt -> finishedAt), so
+client polling granularity does not distort the result.
 
-Each job is a "sleep" job that simulates --work-ms of work, so the ceiling you measure is
-    (workers x consumers-per-worker) / work-ms
-and you can watch it scale as you add workers:
+Two modes:
 
-    docker compose up -d --scale worker=1
-    python scripts/loadtest.py --jobs 300 --work-ms 100
-    docker compose up -d --scale worker=3
-    python scripts/loadtest.py --jobs 300 --work-ms 100
-    docker compose up -d --scale worker=6
-    python scripts/loadtest.py --jobs 300 --work-ms 100
+  Burst (default): submit everything as fast as possible. Measures maximum THROUGHPUT. Latency in this mode is
+  mostly time spent waiting in the queue behind the burst, so do not quote it as a latency figure.
 
-Note: latency here includes time spent waiting in the queue, so a burst larger than capacity shows rising latency.
-That is expected; throughput is the scaling number, latency shows queueing under that load.
+      python scripts/loadtest.py --jobs 1000 --work-ms 100
+
+  Steady (--rate N): submit N jobs/s. Choose N below the system's capacity (see the burst result) and the reported
+  p50/p95/p99 is a meaningful end-to-end LATENCY under sustained load.
+
+      python scripts/loadtest.py --jobs 600 --work-ms 100 --rate 30
+
+Scale workers between runs to see scaling (wait ~60s after scaling up for new workers to boot):
+
+      docker compose up -d --scale worker=3
 """
 import argparse
 import json
@@ -59,17 +61,33 @@ def main():
     parser.add_argument("--api", default="http://localhost:8081", help="API base URL (default: %(default)s)")
     parser.add_argument("--jobs", type=int, default=300, help="number of jobs to submit (default: %(default)s)")
     parser.add_argument("--work-ms", type=int, default=100, help="simulated work per job (default: %(default)s)")
+    parser.add_argument("--rate", type=float, default=0,
+                        help="steady submission rate in jobs/s; 0 = burst (default: %(default)s)")
     parser.add_argument("--submit-threads", type=int, default=16, help="parallel submitters (default: %(default)s)")
     parser.add_argument("--timeout", type=int, default=600, help="give up after this many seconds")
     args = parser.parse_args()
 
     payload = {"type": "sleep", "payload": {"millis": args.work_ms}, "maxAttempts": 1}
 
-    print(f"Submitting {args.jobs} jobs ({args.work_ms} ms of work each) to {args.api} ...")
+    def submit_one():
+        return call("POST", f"{args.api}/api/jobs", payload)["id"]
+
+    mode = f"steady at {args.rate:g} jobs/s" if args.rate > 0 else "burst"
+    print(f"Submitting {args.jobs} jobs ({args.work_ms} ms of work each, {mode}) to {args.api} ...")
     submit_start = time.time()
     try:
         with ThreadPoolExecutor(args.submit_threads) as pool:
-            ids = list(pool.map(lambda _: call("POST", f"{args.api}/api/jobs", payload)["id"], range(args.jobs)))
+            if args.rate > 0:
+                interval = 1.0 / args.rate
+                futures = []
+                for i in range(args.jobs):
+                    delay = submit_start + i * interval - time.time()
+                    if delay > 0:
+                        time.sleep(delay)
+                    futures.append(pool.submit(submit_one))
+                ids = [future.result() for future in futures]
+            else:
+                ids = list(pool.map(lambda _: submit_one(), range(args.jobs)))
     except (urllib.error.URLError, OSError) as error:
         sys.exit(f"Could not reach the API at {args.api}: {error}")
     submit_seconds = time.time() - submit_start
@@ -99,16 +117,19 @@ def main():
     finished = [parse_ts(j["finishedAt"]) for j in succeeded]
     wall = (max(finished) - min(created)).total_seconds()
     latencies_ms = sorted((f - c).total_seconds() * 1000 for c, f in zip(created, finished))
+    latency_note = ("end-to-end, steady load" if args.rate > 0
+                    else "queue wait + work, burst: not a latency figure")
 
     print()
     print("================ RESULT ================")
-    print(f"jobs submitted        : {len(ids)}")
+    print(f"mode                   : {mode}")
+    print(f"jobs submitted         : {len(ids)}")
     print(f"succeeded / dead / lost: {len(succeeded)} / {len(dead)} / {len(ids) - len(jobs)}")
     print(f"simulated work per job : {args.work_ms} ms")
     print(f"wall time (first create -> last finish): {wall:.2f} s")
     print(f"THROUGHPUT             : {len(succeeded) / wall:.1f} jobs/s")
     print(f"latency p50 / p95 / p99: {percentile(latencies_ms, 0.50):.0f} / "
-          f"{percentile(latencies_ms, 0.95):.0f} / {percentile(latencies_ms, 0.99):.0f} ms (queue wait + work)")
+          f"{percentile(latencies_ms, 0.95):.0f} / {percentile(latencies_ms, 0.99):.0f} ms ({latency_note})")
     print("========================================")
     if len(jobs) < len(ids):
         print(f"WARNING: {len(ids) - len(jobs)} job(s) did not finish within {args.timeout}s", file=sys.stderr)

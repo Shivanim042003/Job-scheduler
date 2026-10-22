@@ -41,7 +41,10 @@ public class TestHandlers {
     JobHandler idempotentCountingHandler(IdempotentEffects effects) {
         return JobHandler.of("idempotent-counting", job -> {
             increment(INVOCATIONS, job.getId());
-            effects.runOnce(job.getId(), "apply", () -> increment(EFFECTS, job.getId()));
+            var result = effects.runOnceAsOwner(job, "apply", () -> increment(EFFECTS, job.getId()));
+            if (result == IdempotentEffects.EffectResult.NOT_OWNER) {
+                throw new IllegalStateException("Lost ownership of job " + job.getId());
+            }
         });
     }
 
