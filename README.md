@@ -86,8 +86,10 @@ per-message TTLs in a single queue.
 **Dead-letter routing.** Exhausted and non-retryable jobs are rejected with `requeue=false`; the main queue's
 dead-letter exchange routes them to `jobs.dlq` (with `x-death` headers) for inspection or replay.
 
-**No lost submissions.** The job row is committed first and published after commit with publisher confirms. If the
-API dies or the broker is down in between, the `StaleJobSweeper` republishes jobs stuck in `QUEUED`.
+**No lost submissions (transactional outbox).** Submitting writes the job row and an `outbox` row in one database
+transaction. A relay in the API drains the outbox in batches (`FOR UPDATE SKIP LOCKED`, one broker confirmation per
+batch), publishes to RabbitMQ and deletes the rows. A crash between "saved" and "published" cannot lose a job. The
+`StaleJobSweeper` remains as a backstop for `QUEUED` jobs whose message went missing.
 
 ## Tests
 
@@ -127,8 +129,21 @@ the Prometheus endpoint; `BackoffPolicyTest` covers the delay math.
   recorded re-runs the handler. Use `IdempotentEffects.runOnce(jobId, key, effect)` so the effect is applied once:
   exactly once for effects in this database (ledger row and effect commit in one transaction), and for external
   systems by passing `jobId + key` as their idempotency key.
-- **Delivery:** consumer side is manual acks (a crashed worker's message is redelivered). Producer side is a
-  committed row, publisher confirms, and a sweeper that republishes jobs stuck in `QUEUED`.
+- **Delivery:** consumer side is manual acks (a crashed worker's message is redelivered). Producer side is the
+  transactional outbox plus publisher confirms. Together this is at-least-once end to end; duplicates are expected
+  and are made harmless by the conditional claim and fenced result writes above.
+
+## Leases, outbox and idempotency keys
+
+- **Lease and reaper (hung workers).** A claim gives the worker a lease (`scheduler.lease.duration`, default 30s) that
+  it renews every 10s while the job runs. If a worker hangs or is cut off while its connection stays open, the broker
+  never redelivers its message, so the reaper (in the API) takes back any `RUNNING` job whose lease expired:
+  jobs with attempts left are requeued, exhausted ones are dead-lettered. The takeover is a compare-and-set on the
+  attempt number, and the old owner's late result is rejected by the fenced writes. The lease must be longer than
+  the renew interval plus any pause you expect (GC, network blips), or live workers will lose jobs.
+- **Idempotency key.** `POST /api/jobs` accepts an optional `Idempotency-Key` header. A repeat with the same key
+  returns the original job (`200`, `Idempotent-Replay: true`) instead of creating a second one; concurrent repeats
+  race on a unique index and exactly one wins. The payload of a repeat is ignored.
 
 ## Observability
 
@@ -164,5 +179,7 @@ results here once measured, together with the machine they were measured on.
   before the result is recorded causes a re-run.
 - Changing `initial-delay`, `max-delay` or `max-attempts` changes retry-queue arguments, which RabbitMQ refuses to
   re-declare; delete the `jobs.retry.*` queues when tuning.
-- No job cancellation, priorities, scheduled (future) start times, or idempotency keys on submission.
+- No job cancellation, dead-letter replay endpoint, priorities, or scheduled (future) start times.
+- The lease protects against a hung or partitioned worker, not against a handler stuck in an infinite loop inside a
+  healthy worker (its heartbeat keeps running). Handlers needing that should enforce their own timeout.
 - No authentication on the REST API.

@@ -12,7 +12,8 @@ class BackoffPolicyTest {
 
     private final BackoffPolicy policy = new BackoffPolicy(new SchedulerProperties(
             new SchedulerProperties.Retry(8, Duration.ofSeconds(2), Duration.ofSeconds(30)),
-            new SchedulerProperties.Sweeper(5000, Duration.ofSeconds(30))));
+            new SchedulerProperties.Sweeper(5000, Duration.ofSeconds(30)),
+            new SchedulerProperties.Lease(Duration.ofSeconds(30), Duration.ofSeconds(10), 5000)));
 
     @Test
     void delayDoublesWithEachFailedAttempt() {

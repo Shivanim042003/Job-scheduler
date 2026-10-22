@@ -3,6 +3,7 @@ package com.jobscheduler.domain;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
@@ -24,6 +25,47 @@ public interface JobRepository extends JpaRepository<Job, UUID> {
 
     long countByStatus(JobStatus status);
 
+    Optional<Job> findByIdempotencyKey(String idempotencyKey);
+
+    List<Job> findTop100ByStatusAndLeaseExpiresAtBefore(JobStatus status, Instant cutoff);
+
+    /** Heartbeat: extends the lease, but only for the exact worker and attempt that currently owns the job. */
+    @Transactional
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("""
+            update Job j set j.leaseExpiresAt = :until
+             where j.id = :id and j.status = :status and j.workerId = :worker and j.attempts = :attempt
+            """)
+    int renewLease(@Param("id") UUID id, @Param("status") JobStatus status, @Param("worker") String worker,
+                   @Param("attempt") int attempt, @Param("until") Instant until);
+
+    /**
+     * Reaper: takes back a RUNNING job whose owner stopped renewing. Clearing workerId and changing the status means
+     * the old owner's late result is rejected by the fenced result writes.
+     */
+    @Transactional
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("""
+            update Job j
+               set j.status = :to, j.lastError = :error, j.updatedAt = :now, j.workerId = null,
+                   j.leaseExpiresAt = null
+             where j.id = :id and j.status = :from and j.attempts = :attempt and j.leaseExpiresAt < :now
+            """)
+    int requeueExpired(@Param("id") UUID id, @Param("from") JobStatus from, @Param("to") JobStatus to,
+                       @Param("error") String error, @Param("now") Instant now, @Param("attempt") int attempt);
+
+    /** Reaper, retries exhausted: the job is dead. */
+    @Transactional
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("""
+            update Job j
+               set j.status = :to, j.lastError = :error, j.finishedAt = :now, j.updatedAt = :now,
+                   j.workerId = null, j.leaseExpiresAt = null
+             where j.id = :id and j.status = :from and j.attempts = :attempt and j.leaseExpiresAt < :now
+            """)
+    int killExpired(@Param("id") UUID id, @Param("from") JobStatus from, @Param("to") JobStatus to,
+                    @Param("error") String error, @Param("now") Instant now, @Param("attempt") int attempt);
+
     /**
      * Atomically moves a job into RUNNING and counts the attempt. This is a compare-and-set on the attempt counter
      * the caller observed: if another worker claimed the job after the caller read it, the counter has moved on and
@@ -34,13 +76,14 @@ public interface JobRepository extends JpaRepository<Job, UUID> {
     @Query("""
             update Job j
                set j.status = :to, j.attempts = j.attempts + 1, j.startedAt = :now,
-                   j.updatedAt = :now, j.workerId = :worker, j.nextRunAt = null
+                   j.updatedAt = :now, j.workerId = :worker, j.nextRunAt = null,
+                   j.leaseExpiresAt = :leaseUntil
              where j.id = :id and j.status in :from and j.attempts = :expectedAttempts
                and j.attempts < j.maxAttempts
             """)
     int claim(@Param("id") UUID id, @Param("from") Collection<JobStatus> from, @Param("to") JobStatus to,
               @Param("now") Instant now, @Param("worker") String worker,
-              @Param("expectedAttempts") int expectedAttempts);
+              @Param("expectedAttempts") int expectedAttempts, @Param("leaseUntil") Instant leaseUntil);
 
     @Transactional
     @Modifying(clearAutomatically = true, flushAutomatically = true)

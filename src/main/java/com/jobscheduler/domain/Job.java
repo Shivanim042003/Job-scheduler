@@ -54,14 +54,25 @@ public class Job {
     private Instant finishedAt;
     private Instant nextRunAt;
 
+    /** While RUNNING: the owner must renew this before it passes, or the reaper takes the job back. */
+    private Instant leaseExpiresAt;
+
+    @Column(length = 200)
+    private String idempotencyKey;
+
     protected Job() {
     }
 
     public Job(String type, Map<String, Object> payload, int maxAttempts) {
+        this(type, payload, maxAttempts, null);
+    }
+
+    public Job(String type, Map<String, Object> payload, int maxAttempts, String idempotencyKey) {
         Instant now = Instant.now();
         this.type = type;
         this.payload = payload == null ? Map.of() : payload;
         this.maxAttempts = maxAttempts;
+        this.idempotencyKey = idempotencyKey;
         this.status = JobStatus.QUEUED;
         this.attempts = 0;
         this.createdAt = now;
@@ -81,4 +92,6 @@ public class Job {
     public Instant getStartedAt() { return startedAt; }
     public Instant getFinishedAt() { return finishedAt; }
     public Instant getNextRunAt() { return nextRunAt; }
+    public Instant getLeaseExpiresAt() { return leaseExpiresAt; }
+    public String getIdempotencyKey() { return idempotencyKey; }
 }

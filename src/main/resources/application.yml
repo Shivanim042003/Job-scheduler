@@ -36,3 +36,9 @@ scheduler:
   sweeper:
     interval-millis: 5000    # how often the API looks for jobs whose publish was lost
     stale-after: 30s
+  lease:
+    duration: 30s            # a RUNNING job whose owner has not renewed within this window is reclaimed
+    renew-every: 10s         # heartbeat interval while a worker runs a job
+    reaper-interval-millis: 5000
+  outbox:
+    poll-millis: 50          # how often the API relays pending submissions to RabbitMQ

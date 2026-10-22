@@ -14,16 +14,19 @@ import java.util.Set;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.support.TransactionSynchronization;
-import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 @Service
 public class JobService {
 
     private static final Logger log = LoggerFactory.getLogger(JobService.class);
     private static final int MAX_ERROR_LENGTH = 2000;
+    private static final int MAX_IDEMPOTENCY_KEY_LENGTH = 200;
 
     private static final Set<JobStatus> CLAIMABLE = EnumSet.of(JobStatus.QUEUED, JobStatus.RETRYING);
     /** After a worker crash the job is still RUNNING in the database; a redelivery may take it over. */
@@ -32,45 +35,73 @@ public class JobService {
     private static final Set<JobStatus> NOT_TERMINAL =
             EnumSet.of(JobStatus.QUEUED, JobStatus.RETRYING, JobStatus.RUNNING);
 
+    /** @param created false when an earlier submission with the same idempotency key was returned instead */
+    public record SubmitResult(Job job, boolean created) {
+    }
+
     private final JobRepository repository;
     private final JobPublisher publisher;
     private final SchedulerProperties properties;
+    private final JdbcTemplate jdbc;
+    private final TransactionTemplate tx;
 
-    public JobService(JobRepository repository, JobPublisher publisher, SchedulerProperties properties) {
+    public JobService(JobRepository repository, JobPublisher publisher, SchedulerProperties properties,
+                      JdbcTemplate jdbc, PlatformTransactionManager transactionManager) {
         this.repository = repository;
         this.publisher = publisher;
         this.properties = properties;
+        this.jdbc = jdbc;
+        this.tx = new TransactionTemplate(transactionManager);
     }
 
     // ---------------------------------------------------------------- submission
 
-    /**
-     * Persists the job, then publishes it once the transaction has committed. Publishing after commit means a
-     * worker can never receive a message for a row it cannot see. If the publish itself fails, the job stays
-     * QUEUED and {@link #republishStaleQueued(Instant)} picks it up.
-     */
-    @Transactional
     public Job submit(String type, Map<String, Object> payload, Integer maxAttempts) {
+        return submit(type, payload, maxAttempts, null).job();
+    }
+
+    /**
+     * Saves the job and an outbox row in ONE transaction. A relay publishes outbox rows to RabbitMQ afterwards
+     * (see {@code OutboxRelay}), so a crash between "job saved" and "message published" cannot lose the job: either
+     * both rows exist and will be relayed, or neither does.
+     *
+     * <p>With an idempotency key, a repeated submission returns the original job instead of creating another. The
+     * payload of the repeat is ignored, as with any idempotency key.
+     */
+    public SubmitResult submit(String type, Map<String, Object> payload, Integer maxAttempts,
+                               String idempotencyKey) {
         int limit = properties.retry().maxAttempts();
         int attempts = maxAttempts == null ? limit : maxAttempts;
         if (attempts < 1 || attempts > limit) {
             throw new IllegalArgumentException("maxAttempts must be between 1 and " + limit);
         }
+        if (idempotencyKey != null
+                && (idempotencyKey.isBlank() || idempotencyKey.length() > MAX_IDEMPOTENCY_KEY_LENGTH)) {
+            throw new IllegalArgumentException(
+                    "Idempotency-Key must be 1 to " + MAX_IDEMPOTENCY_KEY_LENGTH + " characters");
+        }
 
-        Job job = repository.save(new Job(type, payload, attempts));
-        UUID id = job.getId();
-
-        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-            @Override
-            public void afterCommit() {
-                try {
-                    publisher.publishNew(id);
-                } catch (Exception e) {
-                    log.warn("Publish failed for job {}; the sweeper will retry it", id, e);
-                }
+        if (idempotencyKey != null) {
+            Optional<Job> existing = repository.findByIdempotencyKey(idempotencyKey);
+            if (existing.isPresent()) {
+                return new SubmitResult(existing.get(), false);
             }
-        });
-        return job;
+        }
+
+        try {
+            Job job = tx.execute(status -> {
+                Job saved = repository.saveAndFlush(new Job(type, payload, attempts, idempotencyKey));
+                jdbc.update("insert into outbox (job_id) values (?)", saved.getId());
+                return saved;
+            });
+            return new SubmitResult(job, true);
+        } catch (DataIntegrityViolationException e) {
+            // Two requests with the same key raced and the other one committed first: return its job.
+            if (idempotencyKey == null) {
+                throw e;
+            }
+            return new SubmitResult(repository.findByIdempotencyKey(idempotencyKey).orElseThrow(() -> e), false);
+        }
     }
 
     public Optional<Job> find(UUID id) {
@@ -128,12 +159,20 @@ public class JobService {
         }
 
         Set<JobStatus> from = redelivered ? CLAIMABLE_ON_REDELIVERY : CLAIMABLE;
+        Instant now = Instant.now();
         // Compare-and-set on the attempt count we just read: a concurrent claimer that got in first makes this a no-op.
-        int updated = repository.claim(jobId, from, JobStatus.RUNNING, Instant.now(), workerId, job.getAttempts());
+        int updated = repository.claim(jobId, from, JobStatus.RUNNING, now, workerId, job.getAttempts(),
+                now.plus(properties.lease().duration()));
         if (updated == 0) {
             return ClaimResult.skip();
         }
         return ClaimResult.claimed(repository.findById(jobId).orElseThrow());
+    }
+
+    /** Heartbeat from the owning worker: keeps the lease alive while the job runs. */
+    public boolean renewLease(Job job) {
+        return repository.renewLease(job.getId(), JobStatus.RUNNING, job.getWorkerId(), job.getAttempts(),
+                Instant.now().plus(properties.lease().duration())) == 1;
     }
 
     // Result writes are fenced: they apply only while this exact worker still owns this exact attempt. A worker
@@ -157,7 +196,39 @@ public class JobService {
 
     // ---------------------------------------------------------------- recovery
 
-    /** Republishes jobs that were saved but whose message never made it to the broker. */
+    /**
+     * Takes back jobs whose owner stopped renewing its lease (a hung or partitioned worker whose connection is
+     * still open, so the broker never redelivers). Jobs with attempts left go back on the queue; exhausted ones
+     * are declared dead and sent to the dead-letter queue. Safe to run on several API instances at once: each
+     * takeover is a compare-and-set on the attempt number.
+     */
+    public int reapExpiredLeases() {
+        Instant now = Instant.now();
+        int reaped = 0;
+        for (Job job : repository.findTop100ByStatusAndLeaseExpiresAtBefore(JobStatus.RUNNING, now)) {
+            String reason = "Lease expired: worker " + job.getWorkerId()
+                    + " stopped renewing during attempt " + job.getAttempts();
+            try {
+                if (job.getAttempts() >= job.getMaxAttempts()) {
+                    if (repository.killExpired(job.getId(), JobStatus.RUNNING, JobStatus.DEAD, reason, now,
+                            job.getAttempts()) == 1) {
+                        publisher.publishDeadLetter(job.getId());
+                        reaped++;
+                    }
+                } else if (repository.requeueExpired(job.getId(), JobStatus.RUNNING, JobStatus.QUEUED, reason, now,
+                        job.getAttempts()) == 1) {
+                    publisher.publishNew(job.getId());
+                    reaped++;
+                }
+            } catch (Exception e) {
+                // A requeued job whose publish failed stays QUEUED; the stale-job sweeper republishes it.
+                log.warn("Could not finish reaping job {}", job.getId(), e);
+            }
+        }
+        return reaped;
+    }
+
+    /** Republishes jobs that are QUEUED but whose message went missing. Backstop behind the outbox. */
     public int republishStaleQueued(Instant cutoff) {
         List<Job> stale = repository.findTop100ByStatusAndUpdatedAtBefore(JobStatus.QUEUED, cutoff);
         int republished = 0;

@@ -13,6 +13,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -29,11 +30,21 @@ public class JobController {
         this.jobService = jobService;
     }
 
-    /** Asynchronous submission: 202 Accepted with the job's tracking URL. */
+    /**
+     * Asynchronous submission: 202 Accepted with the job's tracking URL. If the optional {@code Idempotency-Key}
+     * header matches an earlier submission, that job is returned with 200 and {@code Idempotent-Replay: true}
+     * instead of creating a duplicate.
+     */
     @PostMapping
-    public ResponseEntity<JobResponse> submit(@Valid @RequestBody SubmitJobRequest request) {
-        var job = jobService.submit(request.type(), request.payload(), request.maxAttempts());
-        return ResponseEntity.accepted()
+    public ResponseEntity<JobResponse> submit(
+            @Valid @RequestBody SubmitJobRequest request,
+            @RequestHeader(name = "Idempotency-Key", required = false) String idempotencyKey) {
+        var result = jobService.submit(request.type(), request.payload(), request.maxAttempts(), idempotencyKey);
+        var job = result.job();
+        ResponseEntity.BodyBuilder response = result.created()
+                ? ResponseEntity.accepted()
+                : ResponseEntity.ok().header("Idempotent-Replay", "true");
+        return response
                 .location(URI.create("/api/jobs/" + job.getId()))
                 .body(JobResponse.from(job));
     }

@@ -1,5 +1,6 @@
 package com.jobscheduler.worker;
 
+import com.jobscheduler.config.SchedulerProperties;
 import com.jobscheduler.domain.Job;
 import com.jobscheduler.messaging.BackoffPolicy;
 import com.jobscheduler.messaging.JobPublisher;
@@ -10,6 +11,10 @@ import io.micrometer.core.instrument.Timer;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Profile;
@@ -37,16 +42,25 @@ public class JobProcessor {
     private final JobPublisher publisher;
     private final BackoffPolicy backoff;
     private final MeterRegistry meterRegistry;
+    private final long renewMillis;
     private final String workerId =
             System.getenv().getOrDefault("HOSTNAME", "worker") + "-" + UUID.randomUUID().toString().substring(0, 8);
 
+    /** One daemon thread renews the leases of every job this worker is running. If the JVM hangs, renewals stop. */
+    private final ScheduledExecutorService heartbeats = Executors.newSingleThreadScheduledExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "lease-heartbeat");
+        thread.setDaemon(true);
+        return thread;
+    });
+
     public JobProcessor(JobService jobService, JobExecutor executor, JobPublisher publisher, BackoffPolicy backoff,
-                        MeterRegistry meterRegistry) {
+                        MeterRegistry meterRegistry, SchedulerProperties properties) {
         this.jobService = jobService;
         this.executor = executor;
         this.publisher = publisher;
         this.backoff = backoff;
         this.meterRegistry = meterRegistry;
+        this.renewMillis = properties.lease().renewEvery().toMillis();
     }
 
     /**
@@ -72,6 +86,8 @@ public class JobProcessor {
                 job.getId(), job.getType(), job.getAttempts(), job.getMaxAttempts(), redelivered);
 
         Timer.Sample sample = Timer.start(meterRegistry);
+        ScheduledFuture<?> heartbeat = heartbeats.scheduleWithFixedDelay(
+                () -> renewLease(job), renewMillis, renewMillis, TimeUnit.MILLISECONDS);
         try {
             executor.execute(job);
         } catch (NonRetryableJobException e) {
@@ -85,6 +101,8 @@ public class JobProcessor {
         } catch (Exception e) {
             stop(sample, "failed");
             return handleFailure(job, e);
+        } finally {
+            heartbeat.cancel(false);
         }
 
         stop(sample, "succeeded");
@@ -93,6 +111,18 @@ public class JobProcessor {
         }
         log.info("Job {} succeeded on attempt {}", job.getId(), job.getAttempts());
         return Settlement.ACK;
+    }
+
+    private void renewLease(Job job) {
+        try {
+            if (!jobService.renewLease(job)) {
+                log.warn("Lease for job {} attempt {} could not be renewed; it was reclaimed or finished",
+                        job.getId(), job.getAttempts());
+            }
+        } catch (Exception e) {
+            // Must not throw: an exception would cancel all future renewals for every running job.
+            log.warn("Lease renewal failed for job {}: {}", job.getId(), e.toString());
+        }
     }
 
     private Settlement handleFailure(Job job, Exception failure) {

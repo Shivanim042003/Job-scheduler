@@ -52,8 +52,10 @@ class JobClaimConcurrencyIntegrationTest {
         var claimable = EnumSet.of(JobStatus.QUEUED, JobStatus.RETRYING, JobStatus.RUNNING);
 
         // Two workers both read the job at attempts=0 and both try to take over (e.g. two redelivered messages).
-        int first = jobRepository.claim(job.getId(), claimable, JobStatus.RUNNING, Instant.now(), "worker-a", 0);
-        int second = jobRepository.claim(job.getId(), claimable, JobStatus.RUNNING, Instant.now(), "worker-b", 0);
+        int first = jobRepository.claim(job.getId(), claimable, JobStatus.RUNNING, Instant.now(), "worker-a", 0,
+                Instant.now().plusSeconds(30));
+        int second = jobRepository.claim(job.getId(), claimable, JobStatus.RUNNING, Instant.now(), "worker-b", 0,
+                Instant.now().plusSeconds(30));
 
         assertThat(first).isEqualTo(1);
         assertThat(second).isZero();

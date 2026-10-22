@@ -5,7 +5,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 
 @ConfigurationProperties(prefix = "scheduler")
-public record SchedulerProperties(@DefaultValue Retry retry, @DefaultValue Sweeper sweeper) {
+public record SchedulerProperties(@DefaultValue Retry retry, @DefaultValue Sweeper sweeper,
+                                  @DefaultValue Lease lease) {
 
     /**
      * @param maxAttempts  total executions allowed per job (first run + retries); also the cap for per-job overrides
@@ -23,5 +24,15 @@ public record SchedulerProperties(@DefaultValue Retry retry, @DefaultValue Sweep
      */
     public record Sweeper(@DefaultValue("5000") long intervalMillis,
                           @DefaultValue("30s") Duration staleAfter) {
+    }
+
+    /**
+     * @param duration          a RUNNING job whose owner has not renewed within this window is taken back
+     * @param renewEvery        how often a worker renews while it runs a job (keep well below {@code duration})
+     * @param reaperIntervalMillis how often the reaper looks for expired leases
+     */
+    public record Lease(@DefaultValue("30s") Duration duration,
+                        @DefaultValue("10s") Duration renewEvery,
+                        @DefaultValue("5000") long reaperIntervalMillis) {
     }
 }
