@@ -163,7 +163,7 @@ python scripts/loadtest.py --jobs 600 --work-ms 100 --rate 30   # steady 30 jobs
 
 In burst mode the reported latency is mostly queue wait behind the burst and should not be quoted.
 
-**Measured latency (steady 30 jobs/s, 6 workers, 600 jobs, simulated 100 ms tasks):** p50 156 ms, p95 232 ms, p99 633 ms end to end, 0 lost. Throughput matched the arrival rate (29.9 jobs/s), so the system was keeping up and these figures are latency rather than queue wait.
+**Latency (steady-load run, separate from the throughput table above):** 600 jobs submitted at a steady 30 jobs/s to 6 workers, simulated 100 ms tasks. End-to-end latency is the time from the job's creation timestamp in the API to its completion timestamp recorded by the worker: p50 156 ms, p95 232 ms, p99 633 ms, 0 lost. Throughput equaled the arrival rate (29.9 jobs/s), so the system was keeping up and the figures are not inflated by queueing. The throughput table above is a different test: a single burst of 1,000 jobs at maximum rate, where latency is mostly queue wait.
 
 ## Observability
 
